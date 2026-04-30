@@ -28,24 +28,20 @@ STATE_NAMES = {
 # ==========================================
 @st.cache_data
 def load_data():
-    orders = pd.read_csv('orders_dataset.csv')
-    order_items = pd.read_csv('order_items_dataset.csv')
-    products = pd.read_csv('products_dataset.csv')
-    categories = pd.read_csv('product_category_name_translation.csv')
-    customers = pd.read_csv('customers_dataset.csv')
-    payments = pd.read_csv('order_payments_dataset.csv')
+    df = pd.read_csv('main_data.csv')
 
-    for col in ['order_purchase_timestamp', 'order_approved_at',
-                'order_delivered_carrier_date', 'order_delivered_customer_date',
-                'order_estimated_delivery_date']:
-        orders[col] = pd.to_datetime(orders[col], errors='coerce')
+    datetime_cols = [
+        'order_purchase_timestamp', 'order_approved_at',
+        'order_delivered_carrier_date', 'order_delivered_customer_date',
+        'order_estimated_delivery_date'
+    ]
+    for col in datetime_cols:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors='coerce')
 
-    # Hapus payment_value = 0 (sesuai notebook)
-    payments = payments[payments['payment_value'] > 0]
+    return df
 
-    return orders, order_items, products, categories, customers, payments
-
-orders, order_items, products, categories, customers, payments = load_data()
+df = load_data()
 
 # ==========================================
 # Header
@@ -55,12 +51,12 @@ st.markdown("**Oleh:** Joyce Abigail Gracia Zebua")
 st.markdown("---")
 
 # ==========================================
-# SIDEBAR: Filter Global — Tanggal Dipisah
+# SIDEBAR: Filter Global
 # ==========================================
 st.sidebar.header("⚙️ Filter Data")
 
-min_date = orders['order_purchase_timestamp'].min().date()
-max_date = orders['order_purchase_timestamp'].max().date()
+min_date = df['order_purchase_timestamp'].min().date()
+max_date = df['order_purchase_timestamp'].max().date()
 
 start_date = st.sidebar.date_input(
     label="📅 Tanggal Mulai",
@@ -83,7 +79,7 @@ if start_date > end_date:
     start_date, end_date = min_date, max_date
 
 # Filter status pesanan
-all_statuses = sorted(orders['order_status'].dropna().unique().tolist())
+all_statuses = sorted(df['order_status'].dropna().unique().tolist())
 selected_statuses = st.sidebar.multiselect(
     "📦 Status Pesanan:",
     options=all_statuses,
@@ -93,14 +89,18 @@ if not selected_statuses:
     selected_statuses = all_statuses
 
 # Terapkan filter
-filtered_orders = orders[
-    (orders['order_purchase_timestamp'].dt.date >= start_date) &
-    (orders['order_purchase_timestamp'].dt.date <= end_date) &
-    (orders['order_status'].isin(selected_statuses))
+# filtered_df = semua baris main_data yang lolos filter (ada duplikasi order karena multi-item)
+# filtered_orders = deduplikasi per order_id, untuk KPI dan tren
+filtered_df = df[
+    (df['order_purchase_timestamp'].dt.date >= start_date) &
+    (df['order_purchase_timestamp'].dt.date <= end_date) &
+    (df['order_status'].isin(selected_statuses))
 ].copy()
 
+filtered_orders = filtered_df.drop_duplicates(subset='order_id').copy()
+
 st.sidebar.markdown("---")
-st.sidebar.metric("Total Pesanan (aktif)", f"{len(filtered_orders):,}")
+st.sidebar.metric("Total Pesanan (aktif)", f"{filtered_orders['order_id'].nunique():,}")
 st.sidebar.caption(f"📆 {start_date} s/d {end_date}")
 
 # ==========================================
@@ -108,8 +108,7 @@ st.sidebar.caption(f"📆 {start_date} s/d {end_date}")
 # ==========================================
 st.subheader("📊 Ringkasan KPI")
 
-merged_kpi = filtered_orders.merge(order_items[['order_id', 'price']], on='order_id', how='left')
-total_revenue = merged_kpi['price'].sum()
+total_revenue = filtered_df['price'].sum()
 total_orders = filtered_orders['order_id'].nunique()
 total_customers = filtered_orders['customer_id'].nunique()
 avg_order_value = total_revenue / total_orders if total_orders > 0 else 0
@@ -171,20 +170,9 @@ st.subheader("💰 Kategori Produk dengan Pendapatan Tertinggi")
 
 top_n_cat = st.slider("Tampilkan Top N Kategori:", min_value=5, max_value=20, value=10, step=1)
 
-if not filtered_orders.empty:
-    merged_cat = (
-        filtered_orders[['order_id']]
-        .merge(order_items[['order_id', 'product_id', 'price']], on='order_id')
-        .merge(products[['product_id', 'product_category_name']], on='product_id')
-        .merge(categories, on='product_category_name', how='left')
-    )
-    merged_cat['product_category_name_english'] = (
-        merged_cat['product_category_name_english']
-        .fillna(merged_cat['product_category_name'])
-    )
-
+if not filtered_df.empty:
     revenue_category = (
-        merged_cat.groupby('product_category_name_english')['price']
+        filtered_df.groupby('product_category_name_english')['price']
         .sum()
         .sort_values(ascending=False)
         .head(top_n_cat)
@@ -219,32 +207,24 @@ else:
 st.markdown("---")
 
 # ==========================================
-# 3. Analisis RFM (sesuai notebook)
+# 3. Analisis RFM
 # ==========================================
 st.subheader("👥 Segmentasi Pelanggan (RFM Analysis)")
 
-if not filtered_orders.empty:
-    # Gabungkan orders + customers + payments (sesuai notebook)
-    rfm_base = filtered_orders.merge(customers[['customer_id', 'customer_unique_id']], on='customer_id', how='inner')
-
-    # Agregasi payment_value per order_id untuk hindari duplikasi cicilan
-    order_payments = payments.groupby('order_id')['payment_value'].sum().reset_index()
-    rfm_base = rfm_base.merge(order_payments, on='order_id', how='inner')
-
+if not filtered_df.empty:
     # Tanggal referensi
-    recent_date = rfm_base['order_purchase_timestamp'].max() + pd.Timedelta(days=1)
+    recent_date = filtered_df['order_purchase_timestamp'].max() + pd.Timedelta(days=1)
 
-    # Hitung R, F, M per customer_unique_id
-    rfm = rfm_base.groupby('customer_unique_id').agg(
+    # Hitung R, F, M langsung dari filtered_df
+    rfm = filtered_df.groupby('customer_unique_id').agg(
         recency=('order_purchase_timestamp', lambda x: (recent_date - x.max()).days),
         frequency=('order_id', 'nunique'),
         monetary=('payment_value', 'sum')
     ).reset_index()
 
-    # Scoring RFM 1-5 (sesuai notebook)
+    # Scoring RFM 1-5
     rfm['R_Score'] = pd.qcut(rfm['recency'], q=5, labels=[5, 4, 3, 2, 1])
     rfm['M_Score'] = pd.qcut(rfm['monetary'], q=5, labels=[1, 2, 3, 4, 5])
-    # Frequency pakai rank() karena mayoritas belanja 1x (duplicate bins)
     rfm['F_Score'] = pd.qcut(rfm['frequency'].rank(method='first'), q=5, labels=[1, 2, 3, 4, 5])
     rfm['RFM_Total'] = rfm[['R_Score', 'F_Score', 'M_Score']].astype(int).sum(axis=1)
 
@@ -263,7 +243,6 @@ if not filtered_orders.empty:
 
     st.markdown(f"**Ambang batas skor RFM Top 5%: ≥ {top_5_threshold:.0f}**")
 
-    # Tab visualisasi
     tab1, tab2, tab3, tab4 = st.tabs([
         "📊 Distribusi Skor RFM",
         "🏆 Top Pelanggan",
@@ -272,7 +251,6 @@ if not filtered_orders.empty:
     ])
 
     with tab1:
-        # Distribusi total skor RFM (sesuai notebook)
         fig_rfm, ax_rfm = plt.subplots(figsize=(10, 5))
         sns.countplot(data=rfm, x='RFM_Total', palette='viridis', ax=ax_rfm)
         ax_rfm.set_title('Distribusi Total Skor RFM Pelanggan', fontsize=14)
@@ -289,7 +267,6 @@ if not filtered_orders.empty:
         st.pyplot(fig_rfm)
 
     with tab2:
-        # Tabel top 10 pelanggan paling loyal
         top_n_rfm = st.selectbox("Tampilkan Top N Pelanggan:", [5, 10, 15, 20], index=1)
         display_cols = top_5_customers[['customer_unique_id', 'recency', 'frequency', 'monetary',
                                         'R_Score', 'F_Score', 'M_Score', 'RFM_Total']].head(top_n_rfm).copy()
@@ -325,7 +302,6 @@ if not filtered_orders.empty:
         st.pyplot(fig_m)
 
     loyal = (rfm['frequency'] > 1).sum()
-    high_spender = top_5_customers.iloc[0]['customer_unique_id'][:12] + '...' if len(top_5_customers) > 0 else '-'
     st.info(
         f"💡 **Insight:** Terdapat **{len(top_5_customers):,} pelanggan** dalam segmen Top 5% (Champions) "
         f"dengan skor RFM ≥ {top_5_threshold:.0f}. "
@@ -345,11 +321,9 @@ st.subheader("🗺️ Volume Transaksi per Wilayah (State)")
 
 top_n_state = st.slider("Tampilkan Top N Wilayah:", min_value=5, max_value=27, value=10, step=1)
 
-if not filtered_orders.empty:
-    filtered_customers = customers[customers['customer_id'].isin(filtered_orders['customer_id'])].copy()
-
+if not filtered_df.empty:
     state_volume = (
-        filtered_customers['customer_state']
+        filtered_orders['customer_state']
         .value_counts()
         .reset_index()
     )
@@ -369,14 +343,12 @@ if not filtered_orders.empty:
     plt.tight_layout()
     st.pyplot(fig4)
 
-    # Keterangan kode state yang tampil — 3 kolom
     st.markdown("**Keterangan Kode State:**")
     displayed_codes = top_states['customer_state'].tolist()
     cols = st.columns(3)
     for i, code in enumerate(displayed_codes):
         cols[i % 3].markdown(f"• **{code}** = {STATE_NAMES.get(code, code)}")
 
-    # Insight
     top1_state = top_states.iloc[0]['customer_state']
     top1_count = top_states.iloc[0]['transaction_count']
     top1_name = STATE_NAMES.get(top1_state, top1_state)
